@@ -1,0 +1,11 @@
+[project]
+name = "meta-harness"
+version = "1.0.0"
+description = "Meta-Harness: LLM agent scaffold for Terminal-Bench 2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic",
+    "harbor>=0.1.44",
+    "litellm<1.82.7",
+    "tenacity",
+]
