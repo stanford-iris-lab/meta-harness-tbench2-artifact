@@ -8,6 +8,7 @@ and injects it into the initial prompt.
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,6 +58,7 @@ class BlockError(Exception):
 
 BLOCK_TIMEOUT_SEC = 600  # 10 minutes
 _MARKER_PREFIX = "__CMDEND__"  # Marker prefix for command completion detection
+_CODEX_DUMMY_API_KEY = "x"
 
 
 @dataclass
@@ -75,6 +77,58 @@ class ImageReadRequest:
 
     file_path: str
     image_read_instruction: str
+
+
+def _first_non_empty_env(*names: str) -> str | None:
+    """Return the first non-empty environment variable value."""
+    for name in names:
+        raw_value = os.getenv(name)
+        if not isinstance(raw_value, str):
+            continue
+        normalized = raw_value.strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _normalize_openai_compatible_api_base(raw_value: str | None) -> str | None:
+    """Normalize either an API base or a full chat/responses endpoint to an API base."""
+    if not isinstance(raw_value, str):
+        return None
+
+    normalized = raw_value.strip().rstrip("/")
+    if not normalized:
+        return None
+
+    if normalized.endswith("/chat/completions"):
+        return normalized.removesuffix("/chat/completions")
+    if normalized.endswith("/responses"):
+        return normalized.removesuffix("/responses")
+    return normalized
+
+
+def _resolve_codex_ssl_verify() -> bool | str | None:
+    """Resolve CODEX-specific TLS verification overrides for LiteLLM.
+
+    Supported forms:
+    - `CODEX_SKIP_SSL_VERIFY=true` to disable verification
+    - `CODEX_SSL_VERIFY=false` to disable verification
+    - `CODEX_SSL_VERIFY=/path/to/ca-bundle.pem` to use a custom CA bundle
+    """
+    skip_ssl = _first_non_empty_env("CODEX_SKIP_SSL_VERIFY")
+    if isinstance(skip_ssl, str) and skip_ssl.lower() in {"1", "true", "yes", "on"}:
+        return False
+
+    ssl_verify = _first_non_empty_env("CODEX_SSL_VERIFY")
+    if ssl_verify is None:
+        return None
+
+    lowered = ssl_verify.lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return ssl_verify
 
 
 # Tool description strings
@@ -375,6 +429,91 @@ class AgentHarness(Terminus2):
             pass
         return None
 
+    def _get_model_request_overrides(self, model_name: str) -> tuple[str, dict[str, Any]]:
+        """Resolve lightweight CODEX routing onto LiteLLM's OpenAI-compatible path.
+
+        Supported entrypoints:
+        - `-m codex/<model>` with optional `CODEX_API_BASE` / `CODEX_API_KEY`
+        - `-m openai/<model>` plus `CODEX_API_BASE`
+        - `-m <model>` plus `CODEX_API_BASE`
+        """
+        normalized_model = model_name.strip()
+        if not normalized_model:
+            return model_name, {}
+
+        explicit_api_base = getattr(self._llm, "_api_base", None)
+        env_codex_api_base = _first_non_empty_env("CODEX_API_BASE")
+        has_codex_credentials = _first_non_empty_env("CODEX_API_KEY") is not None
+        codex_api_base = explicit_api_base or env_codex_api_base
+
+        use_codex_endpoint = False
+        lowered = normalized_model.lower()
+        if lowered.startswith("codex/"):
+            normalized_model = normalized_model.split("/", 1)[1].strip()
+            normalized_model = f"openai/{normalized_model}"
+            use_codex_endpoint = True
+        elif (env_codex_api_base or (explicit_api_base and has_codex_credentials)) and lowered.startswith("openai/"):
+            use_codex_endpoint = True
+        elif (env_codex_api_base or (explicit_api_base and has_codex_credentials)) and "/" not in normalized_model:
+            normalized_model = f"openai/{normalized_model}"
+            use_codex_endpoint = True
+
+        overrides: dict[str, Any] = {}
+        api_base = _normalize_openai_compatible_api_base(codex_api_base)
+        if api_base and (use_codex_endpoint or explicit_api_base):
+            overrides["api_base"] = api_base
+
+        if use_codex_endpoint:
+            overrides["api_key"] = (
+                _first_non_empty_env("CODEX_API_KEY", "OPENAI_API_KEY")
+                or _CODEX_DUMMY_API_KEY
+            )
+            ssl_verify = _resolve_codex_ssl_verify()
+            if ssl_verify is not None:
+                overrides["ssl_verify"] = ssl_verify
+
+        return normalized_model, overrides
+
+    async def _call_litellm_acompletion(self, **completion_kwargs):
+        """Call LiteLLM, applying CODEX-specific SSL overrides when requested.
+
+        LiteLLM's OpenAI-compatible path currently initializes shared clients from
+        global SSL settings, so a per-request `ssl_verify` kwarg is not sufficient.
+        For CODEX endpoints we temporarily set the global LiteLLM SSL config,
+        flush the client cache, execute the request, and then restore state.
+        """
+        ssl_verify = completion_kwargs.get("ssl_verify")
+        if ssl_verify is None:
+            return await litellm.acompletion(**completion_kwargs)
+
+        previous_ssl_verify = getattr(litellm, "ssl_verify", True)
+        previous_env_ssl_verify = os.environ.get("SSL_VERIFY")
+        previous_client_session = getattr(litellm, "client_session", None)
+        previous_aclient_session = getattr(litellm, "aclient_session", None)
+        client_cache = getattr(litellm, "in_memory_llm_clients_cache", None)
+
+        try:
+            litellm.ssl_verify = ssl_verify
+            litellm.client_session = None
+            litellm.aclient_session = None
+            if isinstance(ssl_verify, bool):
+                os.environ["SSL_VERIFY"] = "true" if ssl_verify else "false"
+            else:
+                os.environ["SSL_VERIFY"] = str(ssl_verify)
+            if client_cache is not None and hasattr(client_cache, "flush_cache"):
+                client_cache.flush_cache()
+            return await litellm.acompletion(**completion_kwargs)
+        finally:
+            litellm.ssl_verify = previous_ssl_verify
+            litellm.client_session = previous_client_session
+            litellm.aclient_session = previous_aclient_session
+            if previous_env_ssl_verify is None:
+                os.environ.pop("SSL_VERIFY", None)
+            else:
+                os.environ["SSL_VERIFY"] = previous_env_ssl_verify
+            if client_cache is not None and hasattr(client_cache, "flush_cache"):
+                client_cache.flush_cache()
+
     def _parse_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> tuple[list[Command], bool, str, str, str, ImageReadRequest | None]:
@@ -487,17 +626,19 @@ class AgentHarness(Terminus2):
         Retries on rate limit, network, and server errors.
         Does NOT retry on BadRequestError (e.g. image too large).
         """
+        resolved_model, request_overrides = self._get_model_request_overrides(model)
         kwargs = {
-            "model": model,
+            "model": resolved_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "timeout": 900,  # 15 minutes timeout, retry on timeout
             "drop_params": True,
         }
+        kwargs.update(request_overrides)
         # Image analysis doesn't need high reasoning effort
         # Skip reasoning_effort to use default (faster response)
-        return await litellm.acompletion(**kwargs)
+        return await self._call_litellm_acompletion(**kwargs)
 
     async def _execute_image_read(
         self,
@@ -611,19 +752,23 @@ class AgentHarness(Terminus2):
         """
         # Apply Anthropic caching
         messages = add_anthropic_caching(messages, self._model_name)
+        resolved_model, request_overrides = self._get_model_request_overrides(
+            self._model_name
+        )
 
         # Build completion kwargs
         completion_kwargs = {
-            "model": self._model_name,
+            "model": resolved_model,
             "messages": messages,
             "temperature": self._temperature,
             "tools": TOOLS,
             "timeout": 900,  # 15 minutes timeout, retry on timeout
             "drop_params": True,
         }
+        completion_kwargs.update(request_overrides)
 
         # Add api_base if available
-        if hasattr(self._llm, "_api_base") and self._llm._api_base:
+        if "api_base" not in completion_kwargs and hasattr(self._llm, "_api_base") and self._llm._api_base:
             completion_kwargs["api_base"] = self._llm._api_base
 
         # Add reasoning effort if available
@@ -633,7 +778,7 @@ class AgentHarness(Terminus2):
             completion_kwargs["temperature"] = 1
 
         try:
-            response = await litellm.acompletion(**completion_kwargs)
+            response = await self._call_litellm_acompletion(**completion_kwargs)
         except LiteLLMContextWindowExceededError:
             raise ContextLengthExceededError()
 
